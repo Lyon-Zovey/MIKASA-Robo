@@ -166,6 +166,66 @@ def _override_human_render_camera(env_id: str, viewer_camera: str):
             env_class._default_human_render_camera_configs = orig
 
 
+class SensorDataCollectWrapper(gym.ObservationWrapper):
+    """Extracts per-camera modalities directly from raw sensor_data.
+
+    Produced observation keys
+    -------------------------
+    rgb    : (B, H, W, 6)  uint8   – base_camera RGB (ch 0-2) + hand_camera RGB (ch 3-5)
+    depth  : (B, H, W, 1)  float32 – base_camera depth in metres
+    seg    : (B, H, W, 1)  int32   – base_camera segmentation IDs
+    joints : (B, D)        float32 – flattened agent + extra state vector
+    """
+
+    def __init__(self, env) -> None:
+        from mani_skill.envs.sapien_env import BaseEnv
+        self._base_env: BaseEnv = env.unwrapped
+        super().__init__(env)
+        sample_obs, _ = env.reset()
+        new_obs = self.observation(sample_obs)
+        self._base_env.update_obs_space(new_obs)
+
+    def observation(self, observation: dict) -> dict:
+        from mani_skill.utils import common
+
+        sensor_data = observation.pop("sensor_data", {})
+        observation.pop("sensor_param", None)
+
+        base = sensor_data.get("base_camera", {})
+        hand = sensor_data.get("hand_camera", {})
+
+        ret = {}
+
+        # ── RGB: base_camera(3ch) ‖ hand_camera(3ch) ──────────────────────────
+        base_rgb = base.get("rgb")
+        hand_rgb = hand.get("rgb")
+        if base_rgb is not None and hand_rgb is not None:
+            ret["rgb"] = torch.cat([base_rgb, hand_rgb], dim=-1)
+        elif base_rgb is not None:
+            ret["rgb"] = base_rgb
+
+        # ── Depth from base_camera only ────────────────────────────────────────
+        base_depth = base.get("depth")
+        if base_depth is not None:
+            ret["depth"] = base_depth
+
+        # ── Segmentation from base_camera only ────────────────────────────────
+        base_seg = base.get("segmentation")
+        if base_seg is not None:
+            ret["seg"] = base_seg
+
+        # ── Joints: flatten agent + extra ─────────────────────────────────────
+        extra_agent = {}
+        for key in ["extra", "agent"]:
+            if key in observation:
+                extra_agent[key] = observation.pop(key)
+        ret["joints"] = common.flatten_state_dict(
+            extra_agent, use_torch=True, device=self._base_env.device
+        )
+
+        return ret
+
+
 def env_info(env_id):
     noop_steps = 1
     if env_id in ['ShellGamePush-v0', 'ShellGamePick-v0', 'ShellGameTouch-v0']:
@@ -322,7 +382,7 @@ def collect_batched_data_from_ckpt(
     )
 
     env_kwargs_rgb = dict(
-        obs_mode="rgb",
+        obs_mode="rgb+depth+segmentation",
         control_mode="pd_joint_delta_pos",
         render_mode="all",
         sim_backend="gpu",
@@ -351,14 +411,7 @@ def collect_batched_data_from_ckpt(
     for wrapper_class, wrapper_kwargs in rgb_wrappers_list:
         env_rgb = wrapper_class(env_rgb, **wrapper_kwargs)
 
-    env_rgb = FlattenRGBDObservationWrapper(
-        env_rgb, 
-        rgb=True,
-        depth=False,
-        state=False,
-        oracle=False,
-        joints=True
-    )
+    env_rgb = SensorDataCollectWrapper(env_rgb)
 
     if isinstance(env_state.action_space, gym.spaces.Dict):
         env_state = FlattenActionSpaceWrapper(env_state)
@@ -394,25 +447,24 @@ def collect_batched_data_from_ckpt(
     # Dataset collection
     print(f"Generating {NUMBER_OF_TRAIN_DATA} episodes in {NUMBER_OF_BATCHES} batches (batched with batch size {batch_size})")
     for episode in tqdm(range(NUMBER_OF_BATCHES)):
-        rgbList, jointsList,actList, rewList, succList, doneList = [], [], [], [], [], []
-        
+        rgbList, depthList, segList, jointsList, actList, rewList, succList, doneList = [], [], [], [], [], [], [], []
+
         # Reset of both environments with the same seed for synchronization
-        # seed = np.random.randint(0, 10000)
         seed = episode
         obs_state, _ = env_state.reset(seed=seed)
         obs_rgb, _ = env_rgb.reset(seed=seed)
-        
-        done = False
+
         for t in range(episode_timeout):
-            # Get action from agent based on state
             rgbList.append(obs_rgb['rgb'].cpu().numpy())
+            depthList.append(obs_rgb['depth'].cpu().numpy())
+            segList.append(obs_rgb['seg'].cpu().numpy())
             jointsList.append(obs_rgb['joints'].cpu().numpy())
+
             with torch.no_grad():
                 for key, value in obs_state.items():
                     obs_state[key] = value.to(device)
                 action = agent.get_action(obs_state, deterministic=True)
-            
-            # Make a step in both environments with the same action
+
             obs_state, reward_state, term_state, trunc_state, info_state = env_state.step(action)
             obs_rgb, reward_rgb, term_rgb, trunc_rgb, info_rgb = env_rgb.step(action)
 
@@ -421,17 +473,19 @@ def collect_batched_data_from_ckpt(
             actList.append(action.cpu().numpy())
             done = torch.logical_or(term_rgb, trunc_rgb)
             doneList.append(done.cpu().numpy().astype(int))
-            
-            # Check synchronization of environments
-            # assert np.allclose(reward_state.cpu().numpy(), reward_rgb.cpu().numpy()), "Environments desynchronized!"
 
-        DATA = {'rgb': np.array(rgbList), # (15, 6, 128, 128)
-                'joints': np.array(jointsList), # (15, 25)
-                'action': np.array(actList), # (15, 8)
-                'reward': np.array(rewList), # (15,)
-                'success': np.array(succList), # (15,)
-                'done': np.array(doneList)} # (15,)
-        
+        # rgb:   (T, B, H, W, 6)  – base_camera(3ch) + hand_camera(3ch)
+        # depth: (T, B, H, W, 1)  – base_camera depth in metres
+        # seg:   (T, B, H, W, 1)  – base_camera segmentation IDs
+        DATA = {'rgb':     np.array(rgbList),
+                'depth':   np.array(depthList),
+                'seg':     np.array(segList),
+                'joints':  np.array(jointsList),
+                'action':  np.array(actList),
+                'reward':  np.array(rewList),
+                'success': np.array(succList),
+                'done':    np.array(doneList)}
+
         file_path = f'{save_dir}/train_data_{episode}.npz'
         np.savez(file_path, **DATA)
         
@@ -460,19 +514,19 @@ def collect_unbatched_data_from_batched(env_id="ShellGameTouch-v0", path_to_save
         episode = np.load(f'{dir_with_batched_data}/train_data_{episode}.npz')
         episode = {key: episode[key] for key in episode.keys()}
         for trajectory_num in range(episode['reward'].shape[1]):
-            unbatched_rgb = episode['rgb'][:, trajectory_num, :, :, :]
-            unbatched_joints = episode['joints'][:, trajectory_num, :]
-            unbatched_action = episode['action'][:, trajectory_num, :]
-            unbatched_reward = episode['reward'][:, trajectory_num]
-            unbatched_success = episode['success'][:, trajectory_num]
-            unbatched_done = episode['done'][:, trajectory_num]
-
-            DATA = {'rgb': unbatched_rgb,
-                    'joints': unbatched_joints,
-                    'action': unbatched_action,
-                    'reward': unbatched_reward,
-                    'success': unbatched_success,
-                    'done': unbatched_done}
+            DATA = {
+                'rgb':     episode['rgb'][:,     trajectory_num, :, :, :],
+                'joints':  episode['joints'][:,  trajectory_num, :],
+                'action':  episode['action'][:,  trajectory_num, :],
+                'reward':  episode['reward'][:,  trajectory_num],
+                'success': episode['success'][:, trajectory_num],
+                'done':    episode['done'][:,     trajectory_num],
+            }
+            # depth and seg are present only when collected with rgb+depth+segmentation obs_mode
+            if 'depth' in episode:
+                DATA['depth'] = episode['depth'][:, trajectory_num, :, :, :]
+            if 'seg' in episode:
+                DATA['seg']   = episode['seg'][:,   trajectory_num, :, :, :]
 
             file_path = f'{save_dir_unbatched}/train_data_{traj_cnt}.npz'
             np.savez(file_path, **DATA)
@@ -535,20 +589,19 @@ def collect_single_episode_with_visualization(
         env_state = FlattenActionSpaceWrapper(env_state)
     env_state = ManiSkillVectorEnv(env_state, 1, ignore_terminations=True)
 
-    # ── visual env (SAPIEN viewer + rgb obs for data) ─────────────────────────
+    # ── visual env (SAPIEN viewer + rgb/depth/seg obs for data) ──────────────
     print(f"[2/3] Building visual env (viewer_camera='{viewer_camera}')...")
     with _override_human_render_camera(env_id, viewer_camera):
         env_vis = gym.make(
             env_id, num_envs=1,
-            obs_mode="rgb",
+            obs_mode="rgb+depth+segmentation",
             render_mode="human",       # ← opens the SAPIEN interactive viewer
             sim_backend="gpu",
             reward_mode="normalized_dense",
         )
     for WC, kw in wl_vis:
         env_vis = WC(env_vis, **kw)
-    env_vis = FlattenRGBDObservationWrapper(
-        env_vis, rgb=True, depth=False, state=False, oracle=False, joints=True)
+    env_vis = SensorDataCollectWrapper(env_vis)
     if isinstance(env_vis.action_space, gym.spaces.Dict):
         env_vis = FlattenActionSpaceWrapper(env_vis)
     env_vis = ManiSkillVectorEnv(env_vis, 1, ignore_terminations=True)
@@ -563,7 +616,7 @@ def collect_single_episode_with_visualization(
     obs_state, _ = env_state.reset(seed=seed)
     obs_vis,   _ = env_vis.reset(seed=seed)
 
-    rgbList, jointsList, actList, rewList, succList, doneList = [], [], [], [], [], []
+    rgbList, depthList, segList, jointsList, actList, rewList, succList, doneList = [], [], [], [], [], [], [], []
 
     print(f"\nRunning episode  env={env_id}  seed={seed}  timeout={episode_timeout} steps")
     print("SAPIEN viewer controls: right-drag=rotate  scroll=zoom  mid-drag=pan")
@@ -572,6 +625,8 @@ def collect_single_episode_with_visualization(
 
     for t in tqdm(range(episode_timeout), desc="steps"):
         rgbList.append(obs_vis["rgb"].cpu().numpy())
+        depthList.append(obs_vis["depth"].cpu().numpy())
+        segList.append(obs_vis["seg"].cpu().numpy())
         jointsList.append(obs_vis["joints"].cpu().numpy())
 
         with torch.no_grad():
@@ -615,7 +670,9 @@ def collect_single_episode_with_visualization(
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         DATA = {
-            "rgb":     np.array(rgbList),     # (T, 1, H, W, 3)
+            "rgb":     np.array(rgbList),     # (T, 1, H, W, 6)  base_cam(3ch)+hand_cam(3ch)
+            "depth":   np.array(depthList),   # (T, 1, H, W, 1)  base_cam depth in metres
+            "seg":     np.array(segList),     # (T, 1, H, W, 1)  base_cam segmentation IDs
             "joints":  np.array(jointsList),  # (T, 1, D_joints)
             "action":  np.array(actList),     # (T, 1, D_action)
             "reward":  np.array(rewList),     # (T, 1)
@@ -626,6 +683,8 @@ def collect_single_episode_with_visualization(
         np.savez_compressed(out_path, **DATA)
         print(f"\nEpisode saved → {out_path}")
         print(f"  rgb    : {DATA['rgb'].shape}  uint8")
+        print(f"  depth  : {DATA['depth'].shape}  float32")
+        print(f"  seg    : {DATA['seg'].shape}  int32")
         print(f"  joints : {DATA['joints'].shape}")
         print(f"  action : {DATA['action'].shape}")
 
