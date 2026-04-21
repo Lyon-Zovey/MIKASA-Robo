@@ -1,10 +1,13 @@
 from setuptools import setup, find_packages
 import os
-from pkg_resources import parse_requirements
 
 def read_requirements(filename):
     with open(filename, 'r') as f:
-        return [str(req) for req in parse_requirements(f)]
+        return [
+            line.strip()
+            for line in f
+            if line.strip() and not line.startswith('#')
+        ]
 
 setup(
     name="mikasa_robo_suite",

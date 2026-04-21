@@ -5,6 +5,10 @@
 
 videos/
 
+data_with_seed/
+sceneflow/
+live_pcd_data/
+
 *.py[cod]
 __pycache__/
 *.so
