@@ -1034,6 +1034,10 @@ def collect_single_episode_with_visualization(
     postprocess_camera_data: bool = True,
     postprocess_workers: int = 8,
     postprocess_delete_npy: bool = False,
+    vis_step_delay: float = 0.0,
+    vis_loop_pointflow: int = 0,
+    replay_h5: Optional[str] = None,
+    replay_traj_id: Optional[str] = None,
 ) -> None:
     """Collect `count` episodes with oracle RL rollout, display them live in the
     SAPIEN interactive viewer, and save trajectories in the **exact same layout
@@ -1276,21 +1280,61 @@ def collect_single_episode_with_visualization(
         print("  point overlay mode     : off")
     print("SAPIEN viewer controls: right-drag=rotate  scroll=zoom  mid-drag=pan\n")
 
+    # ── optional H5 replay mode (use recorded actions+env_states for tight pointflow tracking) ──
+    h5_actions, h5_env_states_list = None, None
+    if replay_h5 is not None:
+        import h5py
+        from mani_skill.trajectory import utils as _traj_utils
+        if replay_traj_id is None:
+            raise ValueError("replay_h5 set but replay_traj_id is None; pass --replay-traj-id traj_<N>")
+        with h5py.File(replay_h5, "r") as _hf:
+            if replay_traj_id not in _hf:
+                raise KeyError(f"{replay_traj_id} not in {replay_h5}; have keys: {list(_hf.keys())[:5]}...")
+            grp = _hf[replay_traj_id]
+            h5_actions = np.asarray(grp["actions"])
+            es_grp = grp["env_states"]
+            def _load_h5_group(g):
+                if isinstance(g, h5py.Dataset):
+                    return np.asarray(g)
+                return {k: _load_h5_group(g[k]) for k in g.keys()}
+            es_dict = _load_h5_group(es_grp)
+            h5_env_states_list = _traj_utils.dict_to_list_of_dicts(es_dict)
+        print(f"  [replay-h5] loaded actions shape={h5_actions.shape}, env_states T={len(h5_env_states_list)} from {replay_h5}::{replay_traj_id}")
+        print(f"  [replay-h5] viewer scene will be FORCED to recorded env_states each step → pointflow tracks exactly")
+
     for ep in range(count):
         ep_seed = seed + ep
         obs_state, _ = env_state.reset(seed=ep_seed)
         obs_vis, _   = env_vis.reset(seed=ep_seed)
 
-        for t in tqdm(range(episode_timeout),
-                      desc=f"ep {ep+1}/{count} (seed={ep_seed})", leave=False):
-            with torch.no_grad():
-                for k in obs_state:
-                    obs_state[k] = obs_state[k].to(device)
-                action = agent.get_action(obs_state, deterministic=True)
+        if replay_h5 is not None and h5_env_states_list is not None:
+            env_vis.base_env.set_state_dict(h5_env_states_list[0])
+            if hasattr(env_vis, "overwrite_last_id_pose_snapshot"):
+                try:
+                    env_vis.overwrite_last_id_pose_snapshot()
+                except Exception:
+                    pass
 
-            obs_state, _, _, _, _ = env_state.step(action)
-            action_np = action.detach().cpu().numpy()
+        loop_steps = episode_timeout if h5_actions is None else min(episode_timeout, h5_actions.shape[0])
+
+        for t in tqdm(range(loop_steps),
+                      desc=f"ep {ep+1}/{count} (seed={ep_seed})", leave=False):
+            if h5_actions is not None:
+                action_np = h5_actions[t].astype(np.float32)
+                if action_np.ndim == 1:
+                    action_np = action_np[None, :]
+            else:
+                with torch.no_grad():
+                    for k in obs_state:
+                        obs_state[k] = obs_state[k].to(device)
+                    action = agent.get_action(obs_state, deterministic=True)
+                obs_state, _, _, _, _ = env_state.step(action)
+                action_np = action.detach().cpu().numpy()
+
             obs_vis, reward, term, trunc, info = env_vis.step(action_np)
+
+            if h5_env_states_list is not None and (t + 1) < len(h5_env_states_list):
+                env_vis.base_env.set_state_dict(h5_env_states_list[t + 1])
 
             # Point-cloud overlay in the SAPIEN viewer.
             if visualize_pointflow:
@@ -1337,9 +1381,41 @@ def collect_single_episode_with_visualization(
                     break
                 raise
 
-            # stop early if the episode actually ended (term or trunc)
-            if bool(np.asarray(term).any()) or bool(np.asarray(trunc).any()):
+            if vis_step_delay > 0:
+                import time as _time
+                _time.sleep(vis_step_delay)
+
+            if h5_env_states_list is None and (
+                bool(np.asarray(term).any()) or bool(np.asarray(trunc).any())
+            ):
                 break
+
+        if vis_loop_pointflow != 0 and visualize_pointflow and getattr(env_vis, "_pointflow_frames", None) is not None:
+            import time as _time
+            T_pf = int(env_vis._pointflow_frames.shape[0])
+            n_loops = vis_loop_pointflow if vis_loop_pointflow > 0 else 10**9
+            loop_delay = vis_step_delay if vis_step_delay > 0 else (1.0 / max(fps, 1))
+            print(f"  [pointflow loop] replaying {T_pf}-frame pointflow {('forever' if vis_loop_pointflow < 0 else str(n_loops)+' times')}  delay={loop_delay:.3f}s/frame  (close viewer window to exit)")
+            try:
+                for _ in range(n_loops):
+                    for fi in range(T_pf):
+                        if h5_env_states_list is not None and fi < len(h5_env_states_list):
+                            try:
+                                env_vis.base_env.set_state_dict(h5_env_states_list[fi])
+                            except Exception:
+                                pass
+                        env_vis._pointflow_frame_idx = fi
+                        env_vis.update_pointflow_visualization()
+                        try:
+                            env_vis.base_env.render_human()
+                        except Exception:
+                            return
+                        viewer = getattr(env_vis.base_env, "_viewer", None)
+                        if viewer is not None and getattr(viewer, "closed", False):
+                            return
+                        _time.sleep(loop_delay)
+            except KeyboardInterrupt:
+                pass
 
         # Success log (optional, after episode)
         try:
@@ -1494,6 +1570,24 @@ class Args:
     Default False so that `scene_point_flow_ref*.npy` survives pass 1 and can
     be fed back via --pointflow-npy for a pass-2 replay overlay. Set True
     only if you're done visualizing and want to save disk space."""
+    vis_step_delay: float = 0.0
+    """Sleep this many seconds between policy steps in --visualize mode for
+    human-watchable playback (default 0 = run as fast as possible, ~5s for a
+    90-step ShellGameTouch episode). Try 0.25 for clear frame-by-frame motion."""
+    vis_loop_pointflow: int = 0
+    """After the episode ends, replay the recorded pointflow animation N more
+    times in the SAPIEN viewer (without re-running the policy). 0 = exit
+    immediately (default), -1 = loop forever until the viewer window is closed."""
+    replay_h5: Optional[str] = None
+    """Path to a Step-2 trajectory.h5 (e.g.
+    `<data>/MIKASA-Robo/demos/<env>/trajectory.<obs>.<ctrl>.physx_cpu.h5`).
+    When set, the viewer rollout uses the H5's recorded actions AND forces
+    `set_state_dict(env_states[t])` after every step, so the live scene tracks
+    the EXACT trajectory that produced the pointflow on disk. Requires
+    --replay-traj-id to pick which episode inside the H5 to replay."""
+    replay_traj_id: Optional[str] = None
+    """Which episode key inside --replay-h5 to replay (e.g. 'traj_0'). Must
+    match the camera_data/<TRAJ_ID>/ directory of the same Step-2 run."""
 
 
 if __name__ == "__main__":
@@ -1536,6 +1630,10 @@ if __name__ == "__main__":
             postprocess_camera_data=args.postprocess_camera_data,
             postprocess_workers=args.postprocess_workers,
             postprocess_delete_npy=args.postprocess_delete_npy,
+            vis_step_delay=args.vis_step_delay,
+            vis_loop_pointflow=args.vis_loop_pointflow,
+            replay_h5=args.replay_h5,
+            replay_traj_id=args.replay_traj_id,
         )
 
     # ── batch mode: full dataset collection ──────────────────────────────────
