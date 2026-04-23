@@ -443,22 +443,21 @@ class RBSRecordEpisode(gym.Wrapper):
             #                                  │
             #                                  ▼
             #   flow_compress  ── reads scene_point_flow_ref*.npy → mp4 (+ optional delete .npy)
+            #                     SKIPPED when RBS_SKIP_FLOW_COMPRESS=1 (no .mp4 produced)
             #
             #   point_compress ── independent of convert/flow
             #   seg_compress   ── independent of convert/flow
             #
             # → Phase 1 (parallel): convert + point + seg
-            # → Phase 2 (serial, after Phase 1 convert):  flow
-            # Set RBS_PER_TRAJ_PARALLEL=0 to fall back to the legacy serial chain
-            # (convert → flow → point → seg).
+            # → Phase 2 (serial, after Phase 1 convert):  flow  (or skip + clean .npy)
+            # Set RBS_PER_TRAJ_PARALLEL=0 to fall back to the legacy serial chain.
+            skip_flow = os.environ.get("RBS_SKIP_FLOW_COMPRESS", "0") == "1"
             phase1 = [
                 ("convert_camera_depths", convert_cmd),
                 ("point_compress",        point_cmd),
                 ("seg_compress",          seg_cmd),
             ]
-            phase2 = [
-                ("flow_compress",         flow_cmd),
-            ]
+            phase2 = [] if skip_flow else [("flow_compress", flow_cmd)]
 
             if os.environ.get("RBS_PER_TRAJ_PARALLEL", "1") != "0":
                 with ThreadPoolExecutor(
@@ -491,6 +490,21 @@ class RBSRecordEpisode(gym.Wrapper):
             else:
                 for _, c in phase1 + phase2:
                     subprocess.run(c, check=True)
+
+            # If flow_compress was skipped, the raw scene_point_flow_ref*.npy
+            # (each ~436 MB at 480x832x91) is still on disk because no one
+            # consumed it. Delete those raw files manually unless
+            # postprocess_delete_npy is False (then user explicitly wants them).
+            # ALWAYS keep the small (~1.2 MB) .anchor.npy files — they hold
+            # the reference frame and are tiny.
+            if skip_flow and self.postprocess_delete_npy:
+                for npy in camera_dir.glob("scene_point_flow_ref*.npy"):
+                    if ".anchor." in npy.name:
+                        continue
+                    try:
+                        npy.unlink()
+                    except Exception as e:
+                        logger.warning(f"could not delete {npy}: {e}")
 
             done_flag.write_text("ok\n")
         except Exception as e:

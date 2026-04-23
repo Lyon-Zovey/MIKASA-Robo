@@ -18,11 +18,13 @@
 # by RBSRecordEpisode (per-pid filename suffix + `_p<pid>_<retry>_<hash>`
 # camera_data dirnames).
 #
-# Why no python-level multiprocessing on a single GPU?
-#   ManiSkill's GPU backend is already batched (one process can drive
-#   `num_envs=N` simulators on the same device), and forking would just
-#   double-load PhysX-GPU / SAPIEN renderer / model weights. ManiSkill's
-#   own `rbs_replay_trajectory.py` only uses `mp.Pool` for the CPU branch.
+# Multi-process per single GPU?  (PROCS_PER_GPU > 1)
+#   YES, useful in practice. RBSRecord blocks every step on GPU->CPU sync
+#   for obs/seg/depth/pose buffers, so a single process leaves the SMs idle
+#   ~80-90% of the time. Stacking K processes on the same device makes their
+#   render bursts overlap each other's CPU work and saturates the GPU.
+#   Trade-off: each process loads its own PhysX-GPU + renderer + weights
+#   (~2-3GB VRAM at NUM_ENVS=8). Pick K so K*VRAM ≤ total - 1GB(desktop).
 #
 # Usage:
 #   bash run_scripts/collect_gpu_batched.sh
@@ -33,6 +35,10 @@
 #
 # Force single-GPU even with multi-GPU machine:
 #   CUDA_VISIBLE_DEVICES=0 bash run_scripts/collect_gpu_batched.sh
+#
+# Saturate a single 8GB GPU with 2 parallel pipelines:
+#   PROCS_PER_GPU=2 NUM_ENVS=8 NUM_EPISODES=64 \
+#       bash run_scripts/collect_gpu_batched.sh
 # ============================================================================
 set -euo pipefail
 
@@ -57,6 +63,21 @@ POSTPROCESS_WORKERS="${POSTPROCESS_WORKERS:-$(( NUM_ENVS < (_NPROC / 3) ? NUM_EN
 # Per-traj subprocess parallelism: run convert/flow/point/seg in parallel
 # within a single traj's postprocess slot (they touch different files).
 PER_TRAJ_PARALLEL="${PER_TRAJ_PARALLEL:-1}"  # 1=on, 0=off
+# Skip flow_compress.py (H.265 mp4 encoding for sceneflow). This is the
+# slowest post-processing step. With SKIP_FLOW_MP4=1 (default), each traj
+# directory keeps only rgb.mp4 (no scene_point_flow_*_v3_10b_h265_crf0.mp4),
+# the raw scene_point_flow_ref*.npy is deleted (when DELETE_NPY=1), and the
+# small .anchor.npy files are preserved. Set =0 if you actually need the
+# tracked flow as mp4.
+SKIP_FLOW_MP4="${SKIP_FLOW_MP4:-1}"  # 1=skip (faster, less disk), 0=encode
+# Multiple Python processes per GPU. RBSRecord blocks on GPU->CPU sync every
+# step (obs/seg/depth/poses), so a single process leaves the GPU idle ~90% of
+# the time. Stacking K independent processes on the same device lets their
+# render bursts overlap each other's CPU work and hammers the SMs harder.
+# Each process gets disjoint seed range so trajectories don't collide.
+# Heuristic: pick K so K * (per-process VRAM) < total VRAM - 1GB(desktop).
+# 8GB card: 2 procs × NUM_ENVS=8 ≈ 4-5GB total, comfortable.
+PROCS_PER_GPU="${PROCS_PER_GPU:-1}"
 
 DATA_ROOT="${DATA_ROOT:-/home/CNF2026716696/Sim_Data/MIKASA_Data_GPU}"
 MIKASA_ROOT="${MIKASA_ROOT:-/home/CNF2026716696/Sim_Data/MIKASA-Robo}"
@@ -83,9 +104,12 @@ else
     fi
 fi
 N_GPUS=${#GPU_LIST[@]}
+TOTAL_PROCS=$(( N_GPUS * PROCS_PER_GPU ))
 
-# Each GPU subprocess gets a (rounded-up) slice of NUM_EPISODES.
-PER_GPU=$(( (NUM_EPISODES + N_GPUS - 1) / N_GPUS ))
+# Each subprocess (one per (gpu_id, slot)) gets a (rounded-up) slice of NUM_EPISODES.
+PER_PROC=$(( (NUM_EPISODES + TOTAL_PROCS - 1) / TOTAL_PROCS ))
+# Backward-compat alias (older messages used PER_GPU naming).
+PER_GPU="${PER_PROC}"
 
 echo "============================================================="
 echo "[gpu-batched] env=${ENV_ID}  total_episodes=${NUM_EPISODES}"
@@ -93,8 +117,10 @@ echo "  num_envs/proc      = ${NUM_ENVS}    sensor = ${SENSOR_W}x${SENSOR_H}"
 echo "  postprocess workers= ${POSTPROCESS_WORKERS}  (cores=${_NPROC})"
 echo "  per-traj parallel  = ${PER_TRAJ_PARALLEL}  (convert+flow+point+seg)"
 echo "  delete raw npy     = ${DELETE_NPY}"
-echo "  GPUs               = ${GPU_LIST[*]}  (${N_GPUS} procs)"
-echo "  episodes/proc      = ${PER_GPU}"
+echo "  skip flow mp4      = ${SKIP_FLOW_MP4}  (1=no scene_point_flow_*.mp4, only rgb.mp4)"
+echo "  GPUs               = ${GPU_LIST[*]}  (${N_GPUS} GPU(s))"
+echo "  procs per GPU      = ${PROCS_PER_GPU}  (total subprocs=${TOTAL_PROCS})"
+echo "  episodes/proc      = ${PER_PROC}"
 echo "  data root          = ${DATA_ROOT}"
 echo "============================================================="
 echo "[hint] num_envs=8 used ~4.5GB VRAM; if you OOM at num_envs=${NUM_ENVS},"
@@ -133,6 +159,7 @@ run_one_subprocess() {
     [[ "${ffmpeg_threads}" -gt 4 ]] && ffmpeg_threads=4
     CUDA_VISIBLE_DEVICES="${gpu_id}" \
     RBS_PER_TRAJ_PARALLEL="${PER_TRAJ_PARALLEL}" \
+    RBS_SKIP_FLOW_COMPRESS="${SKIP_FLOW_MP4}" \
     RBS_FFMPEG_THREADS="${ffmpeg_threads}" \
     "${PYTHON_BIN}" -u -m mikasa_robo_suite.dataset_collectors.get_mikasa_robo_datasets \
         --env_id="${ENV_ID}" \
@@ -149,15 +176,15 @@ run_one_subprocess() {
         "${FLAGS[@]}"
 }
 
-if [[ "${N_GPUS}" == "1" ]]; then
+if [[ "${TOTAL_PROCS}" == "1" ]]; then
     GPU_ID="${GPU_LIST[0]}"
     SEED=$(( SEED_START ))
-    echo "[launch] gpu=${GPU_ID}  seed=${SEED}  episodes=${PER_GPU}  (foreground, live output)"
+    echo "[launch] gpu=${GPU_ID}  seed=${SEED}  episodes=${PER_PROC}  (foreground, live output)"
     echo
-    if run_one_subprocess "${GPU_ID}" "${SEED}" "${PER_GPU}"; then
+    if run_one_subprocess "${GPU_ID}" "${SEED}" "${PER_PROC}"; then
         echo
         echo "[DONE] subprocess finished successfully"
-        echo "  collected output → ${DATA_ROOT}/MIKASA-Robo/gpu_batched/${ENV_ID}/"
+        echo "  collected output → ${DATA_ROOT}/MIKASA-Robo/gpu_batched/${ENV_ID}-${NUM_EPISODES}/"
     else
         echo "[ERROR] subprocess failed (see error output above)"
         exit 1
@@ -165,14 +192,17 @@ if [[ "${N_GPUS}" == "1" ]]; then
 else
     PIDS=()
     LOGS=()
-    for i in "${!GPU_LIST[@]}"; do
-        GPU_ID="${GPU_LIST[$i]}"
-        SEED=$(( SEED_START + i * PER_GPU ))
-        LOG="${DATA_ROOT}/_logs/${ENV_ID}_gpu${GPU_ID}_seed${SEED}.log"
-        echo "[launch] gpu=${GPU_ID}  seed=${SEED}  episodes=${PER_GPU}  log=${LOG}"
-        ( run_one_subprocess "${GPU_ID}" "${SEED}" "${PER_GPU}" ) >"${LOG}" 2>&1 &
-        PIDS+=($!)
-        LOGS+=("${LOG}")
+    proc_idx=0
+    for gpu_id in "${GPU_LIST[@]}"; do
+        for slot in $(seq 0 $(( PROCS_PER_GPU - 1 ))); do
+            SEED=$(( SEED_START + proc_idx * PER_PROC ))
+            LOG="${DATA_ROOT}/_logs/${ENV_ID}_gpu${gpu_id}_slot${slot}_seed${SEED}.log"
+            echo "[launch] gpu=${gpu_id} slot=${slot}  seed=${SEED}  episodes=${PER_PROC}  log=${LOG}"
+            ( run_one_subprocess "${gpu_id}" "${SEED}" "${PER_PROC}" ) >"${LOG}" 2>&1 &
+            PIDS+=($!)
+            LOGS+=("${LOG}")
+            proc_idx=$(( proc_idx + 1 ))
+        done
     done
 
     echo
@@ -180,8 +210,10 @@ else
     for log in "${LOGS[@]}"; do
         echo "       tail -f ${log}"
     done
+    echo "[hint] to watch GPU saturation:"
+    echo "       nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv -l 1"
     echo
-    echo "[wait] waiting for all ${N_GPUS} subprocess(es) to finish ..."
+    echo "[wait] waiting for all ${TOTAL_PROCS} subprocess(es) to finish ..."
 
     fail=0
     for pid in "${PIDS[@]}"; do
@@ -192,8 +224,8 @@ else
     done
 
     if [[ "${fail}" == "0" ]]; then
-        echo "[DONE] all ${N_GPUS} subprocess(es) finished successfully"
-        echo "  collected output → ${DATA_ROOT}/MIKASA-Robo/gpu_batched/${ENV_ID}/"
+        echo "[DONE] all ${TOTAL_PROCS} subprocess(es) finished successfully"
+        echo "  collected output → ${DATA_ROOT}/MIKASA-Robo/gpu_batched/${ENV_ID}-${NUM_EPISODES}/"
     else
         exit 1
     fi
