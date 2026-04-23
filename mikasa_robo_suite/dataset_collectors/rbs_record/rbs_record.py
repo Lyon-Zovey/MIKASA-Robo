@@ -336,7 +336,10 @@ class RBSRecordEpisode(gym.Wrapper):
         self.postprocess_workers = int(postprocess_workers)
         self.postprocess_delete_npy = postprocess_delete_npy
         self._postprocess_executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="camera-postprocess")
+            ThreadPoolExecutor(
+                max_workers=max(1, self.postprocess_workers),
+                thread_name_prefix="camera-postprocess",
+            )
             if self.postprocess_camera_data
             else None
         )
@@ -404,8 +407,6 @@ class RBSRecordEpisode(gym.Wrapper):
                 "--workers",
                 "1",
             ]
-            subprocess.run(convert_cmd, check=True)
-
             flow_cmd = [
                 sys.executable,
                 str(flow_script),
@@ -415,8 +416,6 @@ class RBSRecordEpisode(gym.Wrapper):
             ]
             if self.postprocess_delete_npy:
                 flow_cmd.append("--delete_npy")
-            subprocess.run(flow_cmd, check=True)
-
             point_cmd = [
                 sys.executable,
                 str(point_script),
@@ -426,8 +425,6 @@ class RBSRecordEpisode(gym.Wrapper):
                 str(camera_dir),
                 "--delete-existing",
             ]
-            subprocess.run(point_cmd, check=True)
-
             seg_cmd = [
                 sys.executable,
                 str(seg_script),
@@ -439,7 +436,61 @@ class RBSRecordEpisode(gym.Wrapper):
             ]
             if self.postprocess_delete_npy:
                 seg_cmd.append("--delete-source")
-            subprocess.run(seg_cmd, check=True)
+
+            # Dependency graph (per-traj postprocess):
+            #   convert_camera_depths  ──► writes  scene_point_flow_ref*.npy
+            #                                       depth_video_int16mm_dt.b2nd
+            #                                  │
+            #                                  ▼
+            #   flow_compress  ── reads scene_point_flow_ref*.npy → mp4 (+ optional delete .npy)
+            #
+            #   point_compress ── independent of convert/flow
+            #   seg_compress   ── independent of convert/flow
+            #
+            # → Phase 1 (parallel): convert + point + seg
+            # → Phase 2 (serial, after Phase 1 convert):  flow
+            # Set RBS_PER_TRAJ_PARALLEL=0 to fall back to the legacy serial chain
+            # (convert → flow → point → seg).
+            phase1 = [
+                ("convert_camera_depths", convert_cmd),
+                ("point_compress",        point_cmd),
+                ("seg_compress",          seg_cmd),
+            ]
+            phase2 = [
+                ("flow_compress",         flow_cmd),
+            ]
+
+            if os.environ.get("RBS_PER_TRAJ_PARALLEL", "1") != "0":
+                with ThreadPoolExecutor(
+                    max_workers=len(phase1),
+                    thread_name_prefix="rbs-per-traj",
+                ) as pool:
+                    futures = {
+                        pool.submit(subprocess.run, c, check=True): name
+                        for name, c in phase1
+                    }
+                    for fut in futures:
+                        try:
+                            fut.result()
+                        except Exception as sub_exc:
+                            logger.warning(
+                                f"per-traj postprocess step {futures[fut]} "
+                                f"failed for {camera_dir}: {sub_exc}"
+                            )
+                            raise
+                # Phase 2: flow_compress depends on convert's *.npy outputs
+                for name, c in phase2:
+                    try:
+                        subprocess.run(c, check=True)
+                    except Exception as sub_exc:
+                        logger.warning(
+                            f"per-traj postprocess step {name} "
+                            f"failed for {camera_dir}: {sub_exc}"
+                        )
+                        raise
+            else:
+                for _, c in phase1 + phase2:
+                    subprocess.run(c, check=True)
 
             done_flag.write_text("ok\n")
         except Exception as e:

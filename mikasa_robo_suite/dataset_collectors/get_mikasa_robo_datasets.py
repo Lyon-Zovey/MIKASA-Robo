@@ -558,6 +558,234 @@ def collect_unbatched_data_from_batched(env_id="ShellGameTouch-v0", path_to_save
             traj_cnt += 1
 
 
+def collect_gpu_batched_with_sceneflow(
+    env_id: str = "ShellGameTouch-v0",
+    checkpoint_path: Optional[str] = None,
+    save_dir: Optional[str] = None,
+    num_envs: int = 16,
+    num_episodes: int = 64,
+    seed_start: int = 0,
+    fps: int = 16,
+    sensor_width: int = 832,
+    sensor_height: int = 480,
+    record_id_poses: bool = True,
+    record_id_mesh_info: bool = True,
+    postprocess_camera_data: bool = True,
+    postprocess_workers: int = 4,
+    postprocess_delete_npy: bool = False,
+    save_video: bool = True,
+) -> None:
+    """Step-1 + Step-2 fused on GPU + RBSRecordEpisode, no SAPIEN viewer.
+
+    Mirrors the GPU branch of `mani_skill/trajectory/rbs_replay_trajectory.py`:
+    the `RBSRecordEpisode` wrapper sits directly on top of a batched ManiSkill
+    env (num_envs=B, sim_backend="gpu"), `visualize_pointflow` is forced to
+    False (SAPIEN's batched render system on GPU forbids the dynamic point
+    overlay anyway), and `max_steps_per_video=episode_timeout` to satisfy the
+    "video flushing requires a fixed cadence with num_envs>1" invariant in
+    `RBSRecordEpisode.__init__`.
+
+    Output layout (identical to dev_wjj's RBSRecordEpisode):
+        <save_dir>/
+          gpu_batched_seed<S>_<ts>.<obs>.<ctrl>.physx_gpu.h5
+          gpu_batched_seed<S>_<ts>.<obs>.<ctrl>.physx_gpu.json
+          camera_data/
+            traj_<i>[ _p<pid>_<retry>_<hash6> ]/
+              rgb.mp4, depth_video.npy, seg.npy,
+              cam_poses.npy, cam_intrinsics.npy, traj_<i>.h5
+              (+ scene_point_flow_ref*.npy / .b2nd if postprocess_camera_data)
+
+    Multiprocessing: this function is intentionally single-process — on a
+    single GPU the right way to scale is to grow `num_envs` (GPU-internal
+    batched parallelism), not to fork. For multi-GPU machines, run one Python
+    subprocess per GPU via CUDA_VISIBLE_DEVICES + a different `seed_start`
+    (see `run_scripts/collect_gpu_batched.sh`).
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        raise RuntimeError(
+            "collect_gpu_batched_with_sceneflow requires CUDA; "
+            "no GPU is visible. Use --visualize for the CPU path instead."
+        )
+
+    wl_state, episode_timeout = env_info(env_id)
+    wl_vis,   _               = env_info(env_id)
+
+    if num_envs < 1:
+        raise ValueError(f"num_envs must be >= 1 (got {num_envs})")
+    if num_episodes < num_envs:
+        # Round up to one full batch so we don't waste a batch worth of work.
+        num_episodes = num_envs
+    n_batches = (num_episodes + num_envs - 1) // num_envs
+
+    # ── env_state: GPU, batched, state-only — for oracle policy inference ────
+    print(f"[1/3] Building state env  (GPU, num_envs={num_envs}, obs=state)")
+    env_state = gym.make(
+        env_id, num_envs=num_envs,
+        obs_mode="state",
+        render_mode="all",
+        sim_backend="gpu",
+        reward_mode="normalized_dense",
+    )
+    for WC, kw in wl_state:
+        env_state = WC(env_state, **kw)
+    env_state = FlattenRGBDObservationWrapper(
+        env_state, rgb=False, depth=False, state=True, oracle=False, joints=False)
+    if isinstance(env_state.action_space, gym.spaces.Dict):
+        env_state = FlattenActionSpaceWrapper(env_state)
+    env_state = ManiSkillVectorEnv(env_state, num_envs, ignore_terminations=True)
+
+    # ── env_vis: GPU, batched, rgb+depth+segmentation — for RBSRecordEpisode ─
+    # Same wrapper-filtering rule as `collect_single_episode_with_visualization`:
+    # MIKASA's render-overlay wrappers (`RenderStepInfoWrapper`,
+    # `RenderRewardInfoWrapper`, `DebugRewardWrapper`, `*InfoWrapper`) hijack
+    # `env.render()` with a `cv2.putText(...)` call that breaks
+    # `RBSRecordEpisode.capture_image()` on many sapien/opencv combos. They do
+    # NOT touch the underlying simulation/observation/reward — those are the
+    # responsibility of env_state, which keeps them.
+    print(f"[2/3] Building visual env (GPU, num_envs={num_envs}, "
+          f"obs=rgb+depth+segmentation, sensor={sensor_width}×{sensor_height})")
+    env_vis = gym.make(
+        env_id, num_envs=num_envs,
+        obs_mode="rgb+depth+segmentation",
+        render_mode="rgb_array",
+        sim_backend="gpu",
+        reward_mode="normalized_dense",
+        sensor_configs={"base_camera": {"width": sensor_width, "height": sensor_height}},
+    )
+
+    def _is_render_overlay_wrapper(cls) -> bool:
+        name = cls.__name__
+        return ("Render" in name) or ("Debug" in name) or name.endswith("InfoWrapper")
+
+    wl_vis_filtered = [(W, kw) for (W, kw) in wl_vis if not _is_render_overlay_wrapper(W)]
+    _skipped = [W.__name__ for (W, _) in wl_vis if _is_render_overlay_wrapper(W)]
+    if _skipped:
+        print(f"  skipping vis-path render-overlay wrappers: {_skipped}")
+    for WC, kw in wl_vis_filtered:
+        env_vis = WC(env_vis, **kw)
+    if isinstance(env_vis.action_space, gym.spaces.Dict):
+        env_vis = FlattenActionSpaceWrapper(env_vis)
+
+    # save_dir defaults to a separate "gpu_batched" tree so it doesn't clash
+    # with the existing `vis/` (CPU --visualize) or `demos/` (Step-1+Step-2
+    # external pipeline) outputs.
+    if save_dir is None:
+        save_dir = os.path.join("data", "MIKASA-Robo", "gpu_batched", env_id)
+    os.makedirs(save_dir, exist_ok=True)
+
+    import time as _time
+    _ts = _time.strftime("%Y%m%d_%H%M%S")
+    _base_unwrapped = env_vis.unwrapped
+    _suffix = "{}.{}.physx_gpu".format(
+        _base_unwrapped.obs_mode, _base_unwrapped.control_mode,
+    )
+    _traj_name = f"gpu_batched_seed{seed_start}_pid{os.getpid()}_{_ts}.{_suffix}"
+
+    env_vis = RBSRecordEpisode(
+        env_vis,
+        output_dir=save_dir,
+        trajectory_name=_traj_name,
+        save_trajectory=True,
+        save_video=save_video,
+        info_on_video=False,
+        save_on_reset=True,                # flush previous batch at every reset
+        clean_on_close=True,
+        record_reward=True,
+        record_env_state=True,
+        record_id_poses=record_id_poses,
+        record_id_mesh_info=record_id_mesh_info,
+        # ── critical for GPU + num_envs>1 ──
+        # 1. visualize_pointflow MUST be False (RBSRecordEpisode auto-disables
+        #    it on GPU anyway because batched render forbids dynamic
+        #    add_3d_point_list, but we make the intent explicit).
+        # 2. save_video=True with num_envs>1 requires max_steps_per_video to
+        #    be set; rbs_replay_trajectory.py uses env_info["max_episode_steps"],
+        #    which equals our episode_timeout.
+        visualize_pointflow=False,
+        max_steps_per_video=episode_timeout,
+        postprocess_camera_data=postprocess_camera_data,
+        postprocess_workers=postprocess_workers,
+        postprocess_delete_npy=postprocess_delete_npy,
+        video_fps=fps,
+        source_type="rl",
+        source_desc=f"MIKASA-Robo GPU batched RL rollout (oracle agent, env={env_id})",
+    )
+
+    print(f"[3/3] Loading checkpoint: {checkpoint_path}")
+    agent = AgentStateOnly(env_state).to(device)
+    agent.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    agent.eval()
+
+    print(
+        f"\nGPU batched collection  env={env_id}  "
+        f"num_envs={num_envs}  num_episodes={num_episodes}  "
+        f"n_batches={n_batches}  episode_timeout={episode_timeout}\n"
+        f"  save_dir       : {save_dir}\n"
+        f"  trajectory_name: {_traj_name}\n"
+    )
+
+    pbar = tqdm(total=n_batches * episode_timeout, unit="step", dynamic_ncols=True)
+    successes_total = 0
+    episodes_total  = 0
+
+    for batch_idx in range(n_batches):
+        # Each env in the batch gets a deterministic distinct seed:
+        #   seed_start + batch_idx*num_envs + env_idx
+        # ManiSkill's reset(seed=int) auto-broadcasts to per-env seeds (s, s+1,
+        # s+2, ...), so passing the batch-base scalar is enough.
+        batch_seed = seed_start + batch_idx * num_envs
+
+        obs_state, _ = env_state.reset(seed=batch_seed)
+        _,         _ = env_vis.reset(seed=batch_seed)
+
+        last_info = None
+        for t in range(episode_timeout):
+            with torch.no_grad():
+                for k in obs_state:
+                    obs_state[k] = obs_state[k].to(device)
+                action_t = agent.get_action(obs_state, deterministic=True)
+            obs_state, _, _, _, _ = env_state.step(action_t)
+
+            action_np = action_t.detach().cpu().numpy()
+            _, _, _, _, info = env_vis.step(action_np)
+            last_info = info
+
+            pbar.update(1)
+            pbar.set_postfix(
+                batch=f"{batch_idx + 1}/{n_batches}",
+                step=f"{t + 1}/{episode_timeout}",
+            )
+
+        if last_info is not None and "success" in last_info:
+            try:
+                s = last_info["success"]
+                if hasattr(s, "cpu"):
+                    s = s.cpu().numpy()
+                s = np.asarray(s).reshape(-1).astype(bool)
+                successes_total += int(s.sum())
+                episodes_total  += int(s.size)
+            except Exception:
+                pass
+
+    pbar.close()
+
+    # close() triggers the final flush + (optional) postprocess chain
+    env_state.close()
+    env_vis.close()
+
+    if episodes_total > 0:
+        print(
+            f"\n[summary] success rate "
+            f"{successes_total}/{episodes_total} "
+            f"= {100.0 * successes_total / max(episodes_total, 1):.1f}%"
+        )
+    print(f"All {n_batches * num_envs} (≥{num_episodes}) episode(s) written to: {save_dir}")
+    print(f"  trajectory h5  : {os.path.join(save_dir, _traj_name + '.h5')}")
+    print(f"  trajectory json: {os.path.join(save_dir, _traj_name + '.json')}")
+    print(f"  camera_data/   : {os.path.join(save_dir, 'camera_data')}")
+
+
 def _unproject_rgbd_to_world(rgb: np.ndarray,
                              depth: np.ndarray,
                              K: np.ndarray,
@@ -1588,6 +1816,36 @@ class Args:
     replay_traj_id: Optional[str] = None
     """Which episode key inside --replay-h5 to replay (e.g. 'traj_0'). Must
     match the camera_data/<TRAJ_ID>/ directory of the same Step-2 run."""
+    # ── GPU batched mode (Step-1 + Step-2 fused, no viewer) ──────────────────
+    gpu_batched: bool = False
+    """Run `collect_gpu_batched_with_sceneflow`: GPU-batched Step-1+Step-2
+    fused into a single process. RBSRecordEpisode sits directly on top of a
+    `num_envs=N` GPU env, no SAPIEN viewer is opened, point overlay is
+    disabled (SAPIEN's batched render forbids it on GPU anyway), but
+    rgb.mp4 / depth_video.npy / seg.npy / cam_poses.npy / scene_point_flow_*
+    are still produced — exactly the same on-disk layout as Step-2.
+    Multi-process is intentionally NOT done in-Python: on a single GPU,
+    grow `--num-envs`; on multi-GPU, run one Python subprocess per card via
+    `run_scripts/collect_gpu_batched.sh` (CUDA_VISIBLE_DEVICES + seed_start)."""
+    num_envs: int = 8
+    """Per-process GPU batch size for `--gpu-batched`. Tune to fit VRAM:
+    on RTX 5060 8GB with 832×480 sensor, expect 2–6; on RTX 4090 24GB
+    expect 16–32. Each env in the batch produces one independent episode."""
+    num_episodes: int = 64
+    """Total episodes to collect in `--gpu-batched`. Rounded up to a multiple
+    of `--num-envs` so no batch is wasted."""
+    record_id_poses: bool = True
+    """`RBSRecordEpisode.record_id_poses` for `--gpu-batched`. Records per
+    seg-id pose snapshots every step, which the postprocess chain needs to
+    build `scene_point_flow_ref*.npy`. Leave True unless you only want raw
+    rgb/depth/seg and will skip postprocess."""
+    record_id_mesh_info: bool = True
+    """`RBSRecordEpisode.record_id_mesh_info` for `--gpu-batched`. Records
+    per seg-id mesh metadata (vertices/faces) needed by some downstream
+    point-flow tooling."""
+    save_video: bool = True
+    """`RBSRecordEpisode.save_video` for `--gpu-batched`. Set False to skip
+    rgb.mp4 if you only need depth/seg/sceneflow on disk."""
 
 
 if __name__ == "__main__":
@@ -1596,8 +1854,38 @@ if __name__ == "__main__":
     ckpt_dir = args.ckpt_dir
     ENV_ID = args.env_id
 
+    # ── GPU batched mode: Step-1 + Step-2 fused, no viewer ───────────────────
+    if args.gpu_batched:
+        checkpoints = get_list_of_all_checkpoints_available(ckpt_dir=ckpt_dir)
+        ckpt_path = None
+        for env_id, checkpoint in checkpoints:
+            if env_id == ENV_ID:
+                ckpt_path = checkpoint
+                break
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                f"No checkpoint found for '{ENV_ID}' under {ckpt_dir}/oracle_checkpoints/")
+        save_dir = os.path.join(path_to_save_data, "MIKASA-Robo", "gpu_batched", ENV_ID)
+        collect_gpu_batched_with_sceneflow(
+            env_id=ENV_ID,
+            checkpoint_path=ckpt_path,
+            save_dir=save_dir,
+            num_envs=args.num_envs,
+            num_episodes=args.num_episodes,
+            seed_start=args.seed,
+            fps=args.fps,
+            sensor_width=args.sensor_width,
+            sensor_height=args.sensor_height,
+            record_id_poses=args.record_id_poses,
+            record_id_mesh_info=args.record_id_mesh_info,
+            postprocess_camera_data=args.postprocess_camera_data,
+            postprocess_workers=args.postprocess_workers,
+            postprocess_delete_npy=args.postprocess_delete_npy,
+            save_video=args.save_video,
+        )
+
     # ── visualize mode: single episode + SAPIEN viewer ───────────────────────
-    if args.visualize:
+    elif args.visualize:
         checkpoints = get_list_of_all_checkpoints_available(ckpt_dir=ckpt_dir)
         ckpt_path = None
         for env_id, checkpoint in checkpoints:

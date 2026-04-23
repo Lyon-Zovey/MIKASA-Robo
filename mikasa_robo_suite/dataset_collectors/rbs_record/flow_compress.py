@@ -112,7 +112,9 @@ def _tiled_rgb_to_rgba(tiled: np.ndarray, orig_w: int) -> np.ndarray:
 
 def _encode(frames: np.ndarray, path: str, codec: str, pix_fmt: str,
             crf: Optional[int], native_alpha: bool, bits: int,
-            preset: str = "ultrafast", threads: int = 4):
+            preset: str = "ultrafast", threads: Optional[int] = None):
+    if threads is None:
+        threads = max(1, int(os.environ.get("RBS_FFMPEG_THREADS", "2")))
     """Encode frames to video file via ffmpeg pipe."""
     T, H, W, C = frames.shape
     if bits == 10:
