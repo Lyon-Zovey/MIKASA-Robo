@@ -11,11 +11,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # ║                        可 调 参 数  ← 直接改这里                         ║
 # ╠══════════════════════════════════════════════════════════════════════════╣
 
-TASK_ID="ShellGameTouch-v0"
+TASK_ID="InterceptGrabSlow-v0"
 # 任务 ID，脚本会自动加载对应的 oracle policy
 # 可选: InterceptGrabSlow-v0 / ShellGamePush-v0 / ShellGameTouch-v0 / ...
 
-NUM_EPISODES=128
+NUM_EPISODES=1024
 # 总共采集多少条轨迹（跨所有进程累计）
 
 NUM_PROCS=4
@@ -23,7 +23,7 @@ NUM_PROCS=4
 # 每进程约占 2-3 GB VRAM；单 8 GB GPU 建议 ≤ 2，24 GB GPU 可用 4-6
 
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/data}"
-# 落盘根路径，实际写入: $SAVE_DIR/MIKASA-Robo/gpu_batched/$TASK_ID/
+# 落盘根路径，实际写入: $SAVE_DIR/MIKASA-Robo/gpu_batched/$TASK_ID-$NUM_EPISODES/
 
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -93,12 +93,14 @@ N_GPUS=${#GPU_LIST[@]}
 # 把 NUM_PROCS 个进程尽量均匀分配到各 GPU
 TOTAL_PROCS="${NUM_PROCS}"
 PER_PROC=$(( (NUM_EPISODES + TOTAL_PROCS - 1) / TOTAL_PROCS ))
+OUTPUT_NAME="${OUTPUT_NAME:-${TASK_ID}-${NUM_EPISODES}}"
 
 # ─── 启动信息 ─────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════════╗"
 printf  "║  TASK     : %-47s ║\n" "${TASK_ID}"
 printf  "║  episodes : %-6s   procs : %-6s   envs/proc : %-8s ║\n" \
         "${NUM_EPISODES}" "${TOTAL_PROCS}" "${NUM_ENVS}"
+printf  "║  output   : %-47s ║\n" "${OUTPUT_NAME}"
 printf  "║  save_dir : %-47s ║\n" "${SAVE_DIR}"
 printf  "║  GPUs     : %-47s ║\n" "${GPU_LIST[*]}  (${N_GPUS} GPU(s))"
 echo "╚══════════════════════════════════════════════════════════════╝"
@@ -133,11 +135,12 @@ _run_collect() {
         --fps "${FPS}" \
         --postprocess-workers "${POSTPROCESS_WORKERS}" \
         --path-to-save-data "${SAVE_DIR}" \
+        --gpu-batched-output-name "${OUTPUT_NAME}" \
         "${FLAGS[@]}"
 }
 
 # ─── 采集：单进程（前台，实时输出）/ 多进程（后台，日志文件）────────────────
-OUTPUT_DIR="${SAVE_DIR}/MIKASA-Robo/gpu_batched/${TASK_ID}"
+OUTPUT_DIR="${SAVE_DIR}/MIKASA-Robo/gpu_batched/${OUTPUT_NAME}"
 
 if [[ "${TOTAL_PROCS}" == "1" ]]; then
     GPU_ID="${GPU_LIST[0]}"

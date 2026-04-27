@@ -1834,6 +1834,10 @@ class Args:
     num_episodes: int = 64
     """Total episodes to collect in `--gpu-batched`. Rounded up to a multiple
     of `--num-envs` so no batch is wasted."""
+    gpu_batched_output_name: Optional[str] = None
+    """Optional leaf directory name under
+    `<path_to_save_data>/MIKASA-Robo/gpu_batched/`. Defaults to `env_id`.
+    Useful for separating datasets like `ShellGameTouch-v0-128`."""
     record_id_poses: bool = True
     """`RBSRecordEpisode.record_id_poses` for `--gpu-batched`. Records per
     seg-id pose snapshots every step, which the postprocess chain needs to
@@ -1865,7 +1869,8 @@ if __name__ == "__main__":
         if ckpt_path is None:
             raise FileNotFoundError(
                 f"No checkpoint found for '{ENV_ID}' under {ckpt_dir}/oracle_checkpoints/")
-        save_dir = os.path.join(path_to_save_data, "MIKASA-Robo", "gpu_batched", ENV_ID)
+        output_name = args.gpu_batched_output_name or ENV_ID
+        save_dir = os.path.join(path_to_save_data, "MIKASA-Robo", "gpu_batched", output_name)
         collect_gpu_batched_with_sceneflow(
             env_id=ENV_ID,
             checkpoint_path=ckpt_path,
