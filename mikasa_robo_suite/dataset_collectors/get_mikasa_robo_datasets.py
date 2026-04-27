@@ -1865,8 +1865,7 @@ if __name__ == "__main__":
         if ckpt_path is None:
             raise FileNotFoundError(
                 f"No checkpoint found for '{ENV_ID}' under {ckpt_dir}/oracle_checkpoints/")
-        _dir_suffix = f"-{args.num_episodes}" if args.num_episodes else ""
-        save_dir = os.path.join(path_to_save_data, "MIKASA-Robo", "gpu_batched", f"{ENV_ID}{_dir_suffix}")
+        save_dir = os.path.join(path_to_save_data, "MIKASA-Robo", "gpu_batched", ENV_ID)
         collect_gpu_batched_with_sceneflow(
             env_id=ENV_ID,
             checkpoint_path=ckpt_path,
