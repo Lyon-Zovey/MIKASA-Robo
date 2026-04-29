@@ -11,11 +11,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # ║                        可 调 参 数  ← 直接改这里                         ║
 # ╠══════════════════════════════════════════════════════════════════════════╣
 
-TASK_ID="InterceptGrabSlow-v0"
+TASK_ID="TakeItBack-v0"
 # 任务 ID，脚本会自动加载对应的 oracle policy
 # 可选: InterceptGrabSlow-v0 / ShellGamePush-v0 / ShellGameTouch-v0 / ...
 
-NUM_EPISODES=1024
+NUM_EPISODES=2048
 # 总共采集多少条轨迹（跨所有进程累计）
 
 NUM_PROCS=4

@@ -383,10 +383,18 @@ def _process_traj(traj_dir: Path) -> int:
 
 
 def main() -> int:
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--traj-dir", type=Path, help="single camera_data/traj_<i> dir")
     g.add_argument("--root",     type=Path, help="save_dir; processes every traj under <root>/camera_data/")
+    ap.add_argument(
+        "--workers", "-j", type=int,
+        default=max(1, (os.cpu_count() or 1)),
+        help="parallel worker processes (default: all CPU cores)",
+    )
     args = ap.parse_args()
 
     if args.traj_dir is not None:
@@ -404,13 +412,30 @@ def main() -> int:
     if not trajs:
         print(f"no traj_* directories under {cam_root}", file=sys.stderr)
         return 2
+
+    print(f"[info] {len(trajs)} trajectories, {args.workers} worker(s)")
     total_imgs = 0
     n_traj_ok = 0
-    for p in trajs:
-        k = _process_traj(p)
-        total_imgs += k
-        if k > 0:
-            n_traj_ok += 1
+
+    if args.workers == 1:
+        for p in trajs:
+            k = _process_traj(p)
+            total_imgs += k
+            if k > 0:
+                n_traj_ok += 1
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(_process_traj, p): p for p in trajs}
+            for fut in as_completed(futures):
+                try:
+                    k = fut.result()
+                except Exception as exc:                                    # noqa: BLE001
+                    print(f"[FAIL] {futures[fut].name}: {exc}")
+                    k = 0
+                total_imgs += k
+                if k > 0:
+                    n_traj_ok += 1
+
     print(f"\n[done] {total_imgs} images rendered across {n_traj_ok}/{len(trajs)} trajectories")
     return 0 if total_imgs > 0 else 1
 
